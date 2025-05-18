@@ -1,120 +1,69 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from aiogram.utils import executor
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
 import sqlite3
-from datetime import datetime, timedelta
 import logging
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Токен будет браться из переменной окружения
 import os
+TOKEN = os.getenv('7855276124:AAGl9jGM4ZiSobk2FnQxFthwFaJeKVJis28')
 
-API_TOKEN = "7855276124:AAGl9jGM4ZiSobk2FnQxFthwFaJeKVJis28"  # Прямо указанный токен
-
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
-
-# Инициализация базы данных
-conn = sqlite3.connect('messages.db')
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS messages_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        user_id INTEGER,
-        username TEXT,
-        timestamp TEXT
-    )
-''')
-conn.commit()
-
-# Хендлер на любое входящее текстовое сообщение в группе
-@dp.message_handler(content_types=types.ContentTypes.TEXT)
-async def count_messages(message: Message):
-    if message.chat.type not in ['group', 'supergroup']:
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.full_name
-    timestamp = datetime.utcnow().isoformat()
-
-    cursor.execute('''
-        INSERT INTO messages_log (chat_id, user_id, username, timestamp)
-        VALUES (?, ?, ?, ?)
-    ''', (chat_id, user_id, username, timestamp))
-    conn.commit()
-
-# Команда /stats открывает клавиатуру с выбором периода
-@dp.message_handler(commands=['stats'])
-async def show_period_options(message: Message):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("1 день", callback_data="stats_1d"),
-        InlineKeyboardButton("7 дней", callback_data="stats_7d"),
-        InlineKeyboardButton("30 дней", callback_data="stats_30d"),
-        InlineKeyboardButton("Выбрать даты", callback_data="stats_custom")
-    )
-    await message.reply("Выбери период статистики:", reply_markup=keyboard)
-
-# Обработка кнопок выбора периода
-@dp.callback_query_handler(lambda c: c.data.startswith('stats_'))
-async def process_stats_callback(callback_query: CallbackQuery):
-    data = callback_query.data
-    chat_id = callback_query.message.chat.id
-
-    if data == 'stats_custom':
-        await bot.send_message(chat_id, "Отправь даты в формате: \n`2024-05-01 2024-05-10`", parse_mode='Markdown')
-        return
-
-    days = int(data.replace('stats_', '').replace('d', ''))
-    since = datetime.utcnow() - timedelta(days=days)
-
-    cursor.execute('''
-        SELECT username, COUNT(*) as msg_count FROM messages_log
-        WHERE chat_id = ? AND timestamp >= ?
-        GROUP BY user_id ORDER BY msg_count DESC LIMIT 10
-    ''', (chat_id, since.isoformat()))
-
-    rows = cursor.fetchall()
-    if not rows:
-        await bot.send_message(chat_id, "Нет сообщений за выбранный период.")
-        return
-
-    response = f"📊 СТАТИСТИКА СООБЩЕНИЙ ЗА ПОСЛЕДНИЕ {days} ДНЕЙ\n\n"
-    for username, count in rows:
-        response += f"{username} - {count} сообщений\n"
-
-    await bot.send_message(chat_id, response)
-
-# Обработка пользовательского ввода для диапазона дат
-@dp.message_handler(lambda message: len(message.text.split()) == 2)
-async def custom_date_stats(message: Message):
+# Инициализация базы данных SQLite
+def init_db():
     try:
-        date_from_str, date_to_str = message.text.split()
-        date_from = datetime.strptime(date_from_str, "%Y-%m-%d")
-        date_to = datetime.strptime(date_to_str, "%Y-%m-%d") + timedelta(days=1)
-    except ValueError:
-        await message.reply("Неверный формат дат. Пожалуйста, используй формат: 2024-05-01 2024-05-10")
-        return
+        conn = sqlite3.connect('messages.db')
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS messages
+                     (chat_id INTEGER, user_id INTEGER, username TEXT, message_time TEXT)''')
+        conn.commit()
+        logger.info("База данных инициализирована")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка базы данных: {e}")
+    finally:
+        conn.close()
 
-    cursor.execute('''
-        SELECT username, COUNT(*) as msg_count FROM messages_log
-        WHERE chat_id = ? AND timestamp >= ? AND timestamp < ?
-        GROUP BY user_id ORDER BY msg_count DESC LIMIT 10
-    ''', (message.chat.id, date_from.isoformat(), date_to.isoformat()))
+# Сохранение сообщения
+def save_message(chat_id, user_id, username, message_time):
+    try:
+        conn = sqlite3.connect('messages.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO messages (chat_id, user_id, username, message_time) VALUES (?, ?, ?, ?)",
+                  (chat_id, user_id, username, message_time))
+        conn.commit()
+        logger.info(f"Сообщение сохранено: {username}")
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка сохранения: {e}")
+    finally:
+        conn.close()
 
-    rows = cursor.fetchall()
-    if not rows:
-        await message.reply("Нет сообщений за указанный диапазон дат.")
-        return
+# Команда /start
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот для подсчета сообщений запущен!")
 
-    response = f"📊 СТАТИСТИКА СООБЩЕНИЙ С {date_from_str} ПО {date_to_str[:-3]}\n\n"
-    for username, count in rows:
-        response += f"{username} - {count} сообщений\n"
+# Обработчик сообщений
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.chat.type in ['group', 'supergroup']:
+        chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+        username = update.message.from_user.username or update.message.from_user.first_name
+        message_time = update.message.date.strftime('%Y-%m-%d %H:%M:%S')
+        logger.info(f"Сообщение: chat_id={chat_id}, username={username}, text={update.message.text or '[Non-text]'}")
+        save_message(chat_id, user_id, username, message_time)
 
-    await message.reply(response)
+def main():
+    init_db()
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.ALL, message_handler))
+    logger.info("Бот запущен")
+    application.run_polling()
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    main()
