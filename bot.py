@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 # Токен будет браться из переменной окружения
 import os
-TOKEN = os.getenv('7855276124:AAGl9jGM4ZiSobk2FnQxFthwFaJeKVJis28')
+TOKEN = os.getenv("BOT_TOKEN")
+
 
 # Инициализация базы данных SQLite
 def init_db():
