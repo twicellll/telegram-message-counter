@@ -1,152 +1,114 @@
 import os
-import sqlite3
 import logging
 from datetime import datetime, timedelta
-
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, ConversationHandler
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
 )
+import sqlite3
 
-# Логирование
+# --- Настройка ---
+TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("APP_URL")  # например: https://telegram-message-counter.onrender.com
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен из переменной окружения
-TOKEN = os.getenv("BOT_TOKEN")
-
-# Стейт для пользовательского ввода
-WAITING_FOR_DATES = range(1)
-
-# Инициализация базы
+# --- База данных ---
 def init_db():
-    conn = sqlite3.connect('messages.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            chat_id INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            message_time TEXT
+    with sqlite3.connect("messages.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                chat_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# --- Команды ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я считаю сообщения.")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("1 день", callback_data="1"),
+            InlineKeyboardButton("7 дней", callback_data="7"),
+            InlineKeyboardButton("30 дней", callback_data="30"),
+        ]
+    ]
+    await update.message.reply_text(
+        "Выбери период для статистики:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.chat.type in ['group', 'supergroup']:
+        data = (
+            update.message.chat.id,
+            update.message.from_user.id,
+            update.message.from_user.username or update.message.from_user.full_name,
+            update.message.date.strftime('%Y-%m-%d %H:%M:%S')
         )
-    ''')
-    conn.commit()
-    conn.close()
+        with sqlite3.connect("messages.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", data)
+            conn.commit()
 
-# Сохраняем сообщения
-def save_message(chat_id, user_id, username, message_time):
-    conn = sqlite3.connect('messages.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO messages VALUES (?, ?, ?, ?)", (chat_id, user_id, username, message_time))
-    conn.commit()
-    conn.close()
-
-# /start
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я считаю сообщения в группе 📊")
-
-# Счётчик сообщений
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.chat.type in ['group', 'supergroup']:
-        chat_id = update.message.chat.id
-        user_id = update.message.from_user.id
-        username = update.message.from_user.username or update.message.from_user.full_name
-        message_time = update.message.date.strftime('%Y-%m-%d %H:%M:%S')
-        save_message(chat_id, user_id, username, message_time)
-
-# /stats показывает клавиатуру
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 1 день", callback_data="1d"),
-         InlineKeyboardButton("📆 7 дней", callback_data="7d")],
-        [InlineKeyboardButton("📊 30 дней", callback_data="30d"),
-         InlineKeyboardButton("📌 Выбрать период", callback_data="custom")]
-    ])
-    await update.message.reply_text("Выбери период статистики:", reply_markup=keyboard)
-
-# Обработка кнопки
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
+    days = int(query.data)
+    since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
-    if query.data == "custom":
-        await query.message.reply_text("Отправь даты в формате: `2024-05-01 2024-05-10`", parse_mode='Markdown')
-        return WAITING_FOR_DATES
-
-    days = int(query.data.replace("d", ""))
-    since = datetime.utcnow() - timedelta(days=days)
-    return await send_stats(query.message, chat_id, since)
-
-# Ввод дат от пользователя
-async def handle_custom_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        date_from_str, date_to_str = update.message.text.strip().split()
-        date_from = datetime.strptime(date_from_str, "%Y-%m-%d")
-        date_to = datetime.strptime(date_to_str, "%Y-%m-%d") + timedelta(days=1)
-    except Exception:
-        await update.message.reply_text("Неверный формат. Попробуй так: `2024-05-01 2024-05-10`", parse_mode='Markdown')
-        return WAITING_FOR_DATES
-
-    return await send_stats(update.message, update.message.chat.id, date_from, date_to)
-
-# Функция вывода статистики
-async def send_stats(message, chat_id, date_from, date_to=None):
-    date_to = date_to or datetime.utcnow()
-
-    conn = sqlite3.connect('messages.db')
-    c = conn.cursor()
-    c.execute('''
-        SELECT username, COUNT(*) FROM messages
-        WHERE chat_id = ? AND message_time >= ? AND message_time < ?
-        GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 10
-    ''', (chat_id, date_from.isoformat(), date_to.isoformat()))
-    rows = c.fetchall()
-    conn.close()
+    with sqlite3.connect("messages.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT username, COUNT(*) as count FROM messages
+            WHERE chat_id = ? AND timestamp >= ?
+            GROUP BY user_id
+            ORDER BY count DESC
+            LIMIT 10
+        """, (query.message.chat.id, since))
+        rows = cursor.fetchall()
 
     if not rows:
-        await message.reply_text("Нет сообщений за указанный период.")
-        return ConversationHandler.END
+        await query.message.reply_text("Нет сообщений за выбранный период.")
+        return
 
-    if date_to - date_from >= timedelta(days=30):
-        period_text = f"с {date_from.strftime('%Y-%m-%d')} по {(date_to - timedelta(days=1)).strftime('%Y-%m-%d')}"
-    else:
-        period_text = f"за период"
-
-    text = f"📊 Статистика сообщений {period_text}:\n\n"
+    text = f"📊 Статистика за {days} дней:\n\n"
     for username, count in rows:
-        text += f"— {username}: {count} сообщений\n"
+        text += f"{username}: {count} сообщений\n"
 
-    await message.reply_text(text)
-    return ConversationHandler.END
+    await query.message.reply_text(text)
 
-# Отмена
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
+# --- Основной запуск ---
+async def main():
+    application = Application.builder().token(TOKEN).build()
 
-# main
-def main():
-    init_db()
-    app = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_callback))
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(handle_callback, pattern="custom")],
-        states={WAITING_FOR_DATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_dates)]},
-        fallbacks=[CommandHandler("cancel", cancel)]
+    await application.bot.delete_webhook()
+    await application.bot.set_webhook(f"{APP_URL}/webhook")
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=f"{APP_URL}/webhook"
     )
-    app.add_handler(conv_handler)
 
-    app.add_handler(MessageHandler(filters.ALL, message_handler))
-    logger.info("Бот запущен")
-    app.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
