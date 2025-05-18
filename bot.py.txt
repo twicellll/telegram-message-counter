@@ -1,0 +1,126 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.utils import executor
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+import sqlite3
+from datetime import datetime, timedelta
+import logging
+import os
+
+API_TOKEN = os.getenv("BOT_TOKEN")  # Вставь свой токен сюда или используй переменные окружения
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+
+# Инициализация базы данных
+conn = sqlite3.connect('messages.db')
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS messages_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user_id INTEGER,
+        username TEXT,
+        timestamp TEXT
+    )
+''')
+conn.commit()
+
+# Хендлер на любое входящее текстовое сообщение в группе
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def count_messages(message: Message):
+    if message.chat.type not in ['group', 'supergroup']:
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.full_name
+    timestamp = datetime.utcnow().isoformat()
+
+    cursor.execute('''
+        INSERT INTO messages_log (chat_id, user_id, username, timestamp)
+        VALUES (?, ?, ?, ?)
+    ''', (chat_id, user_id, username, timestamp))
+    conn.commit()
+
+# Команда /stats открывает клавиатуру с выбором периода
+@dp.message_handler(commands=['stats'])
+async def show_period_options(message: Message):
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("1 день", callback_data="stats_1d"),
+        InlineKeyboardButton("7 дней", callback_data="stats_7d"),
+        InlineKeyboardButton("30 дней", callback_data="stats_30d"),
+        InlineKeyboardButton("Выбрать даты", callback_data="stats_custom")
+    )
+    await message.reply("Выбери период статистики:", reply_markup=keyboard)
+
+# Обработка кнопок выбора периода
+@dp.callback_query_handler(lambda c: c.data.startswith('stats_'))
+async def process_stats_callback(callback_query: CallbackQuery):
+    data = callback_query.data
+    chat_id = callback_query.message.chat.id
+
+    if data == 'stats_custom':
+        await bot.send_message(chat_id, "Отправь даты в формате: \n`2024-05-01 2024-05-10`", parse_mode='Markdown')
+        return
+
+    days = int(data.replace('stats_', '').replace('d', ''))
+    since = datetime.utcnow() - timedelta(days=days)
+
+    cursor.execute('''
+        SELECT username, COUNT(*) as msg_count FROM messages_log
+        WHERE chat_id = ? AND timestamp >= ?
+        GROUP BY user_id ORDER BY msg_count DESC LIMIT 10
+    ''', (chat_id, since.isoformat()))
+
+    rows = cursor.fetchall()
+    if not rows:
+        await bot.send_message(chat_id, "Нет сообщений за выбранный период.")
+        return
+
+    response = f"📊 СТАТИСТИКА СООБЩЕНИЙ ЗА ПОСЛЕДНИЕ {days} ДНЕЙ
+
+"
+    for username, count in rows:
+        response += f"{username} - {count} сообщений
+"
+
+    await bot.send_message(chat_id, response)
+
+# Обработка пользовательского ввода для диапазона дат
+@dp.message_handler(lambda message: len(message.text.split()) == 2)
+async def custom_date_stats(message: Message):
+    try:
+        date_from_str, date_to_str = message.text.split()
+        date_from = datetime.strptime(date_from_str, "%Y-%m-%d")
+        date_to = datetime.strptime(date_to_str, "%Y-%m-%d") + timedelta(days=1)
+    except ValueError:
+        await message.reply("Неверный формат дат. Пожалуйста, используй формат: 2024-05-01 2024-05-10")
+        return
+
+    cursor.execute('''
+        SELECT username, COUNT(*) as msg_count FROM messages_log
+        WHERE chat_id = ? AND timestamp >= ? AND timestamp < ?
+        GROUP BY user_id ORDER BY msg_count DESC LIMIT 10
+    ''', (message.chat.id, date_from.isoformat(), date_to.isoformat()))
+
+    rows = cursor.fetchall()
+    if not rows:
+        await message.reply("Нет сообщений за указанный диапазон дат.")
+        return
+
+    response = f"📊 СТАТИСТИКА СООБЩЕНИЙ С {date_from_str} ПО {date_to_str[:-3]}
+
+"
+    for username, count in rows:
+        response += f"{username} - {count} сообщений
+"
+
+    await message.reply(response)
+
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
